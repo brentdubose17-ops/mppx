@@ -68,6 +68,31 @@ export async function handler(request: Request) {
 
 Generate `MPP_SECRET_KEY` with at least 32 bytes, for example: `openssl rand -base64 32`.
 
+### Dynamic prices
+
+A challenge `id` is an HMAC over the issued parameters, including the serialized `request`. `Challenge.verify` recomputes that HMAC from the credential's echoed challenge and compares it to the echoed `id`. The route then rebuilds a challenge from the arguments of this `charge()` call and compares the two. That check is `getChallengeBindingMismatch` in `src/server/Mppx.ts`. Built-in charge methods pin `amount`, so a quote that moved after the challenge was issued fails with `credential amount does not match this route's requirements` while the HMAC is still valid.
+
+`Credential.deserialize(authorization).challenge.request.amount` is the echoed amount. Tempo, Stripe, and EVM store it in base units, after scaling the decimal `amount` passed to `charge()` by the method's `decimals`. Bounds-check that value against your current quote in the same units, and accept it only when it is still at least 90% of the quote. Convert an accepted amount back with `formatUnits` and those `decimals` (Tempo's default token uses `6`), then pass the decimal string to `charge()`. When the echoed amount is below the floor, or the request has no Payment credential, pass the current quote so the client receives a challenge for the live price. Other pinned fields, such as `currency` and `recipient`, still have to match the echoed challenge.
+
+`Credential.deserialize` takes the `Payment` scheme value. `Credential.extractPaymentScheme` reads it from `Authorization`. With `requiresAuth: true`, read `Payment-Authorization` instead. A method that keeps `amount` as the original decimal string can pass that echoed string to `charge()` after the same bounds check. In the snippet, `decimals` is the method's decimals, `mppx` is the handler above, and `currentQuoteBaseUnits()` returns the quote in base units.
+
+```ts
+import { Credential } from 'mppx'
+import { formatUnits } from 'viem'
+
+const header = request.headers.get('Authorization') ?? ''
+const payment = Credential.extractPaymentScheme(header)
+const echoed = payment ? Credential.deserialize(payment).challenge.request.amount : undefined
+const echoedBase = typeof echoed === 'string' ? BigInt(echoed) : undefined
+const quote = await currentQuoteBaseUnits()
+const base = echoedBase !== undefined && echoedBase * 10n >= quote * 9n ? echoedBase : quote
+const amount = formatUnits(base, decimals)
+
+const response = await mppx.charge({ amount })(request)
+if (response.status === 402) return response.challenge
+return response.withReceipt(Response.json({ data: '...' }))
+```
+
 ### Client
 
 ```ts
