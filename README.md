@@ -70,25 +70,31 @@ Generate `MPP_SECRET_KEY` with at least 32 bytes, for example: `openssl rand -ba
 
 ### Dynamic prices
 
-A challenge `id` is an HMAC over the issued parameters, including the serialized `request`. `Challenge.verify` recomputes that HMAC from the credential's echoed challenge and compares it to the echoed `id`. The route then rebuilds a challenge from the arguments of this `charge()` call and compares the two. That check is `getChallengeBindingMismatch` in `src/server/Mppx.ts`. Built-in charge methods pin `amount`, so a quote that moved after the challenge was issued fails with `credential amount does not match this route's requirements` while the HMAC is still valid.
+A challenge `id` is an HMAC over the issued parameters, including the serialized `request`. `Challenge.verify` recomputes that HMAC from the echoed challenge and compares it to the echoed `id`. `mppx.charge()` builds the challenge it will sign from the `amount` you pass in. When that HMAC check fails, it returns this new challenge (`src/server/Mppx.ts`). Deserialize the credential, then call `Challenge.verify` with the same `MPP_SECRET_KEY`. Use `challenge.request.amount` only when that check succeeds and the value sits between a floor and a ceiling of your current quote (for example, at least 90% and at most 110%). Otherwise pass the live quote, including when the `Payment` credential is absent or the HMAC fails, so the replacement challenge is signed at the current price.
 
-`Credential.deserialize(authorization).challenge.request.amount` is the echoed amount. Tempo, Stripe, and EVM store it in base units, after scaling the decimal `amount` passed to `charge()` by the method's `decimals`. Bounds-check that value against your current quote in the same units, and accept it only when it is still at least 90% of the quote. Convert an accepted amount back with `formatUnits` and those `decimals` (Tempo's default token uses `6`), then pass the decimal string to `charge()`. When the echoed amount is below the floor, or the request has no Payment credential, pass the current quote so the client receives a challenge for the live price. Other pinned fields, such as `currency` and `recipient`, still have to match the echoed challenge.
-
-`Credential.deserialize` takes the `Payment` scheme value. `Credential.extractPaymentScheme` reads it from `Authorization`. With `requiresAuth: true`, read `Payment-Authorization` instead. A method that keeps `amount` as the original decimal string can pass that echoed string to `charge()` after the same bounds check. In the snippet, `decimals` is the method's decimals, `mppx` is the handler above, and `currentQuoteBaseUnits()` returns the quote in base units.
+Tempo, Stripe, and EVM store the echoed amount in base units, after scaling the decimal `amount` passed to `charge()` by the method's `decimals`. `getChallengeBindingMismatch` then compares that signed amount with the echoed challenge, so an in-band verified amount has to be the one passed to `charge()`. Convert it back with `formatUnits` and those `decimals` (Tempo's default token uses `6`). Other pinned fields, such as `currency` and `recipient`, still have to match. `Credential.extractPaymentScheme` reads the `Payment` value from `Authorization`; with `requiresAuth: true`, read `Payment-Authorization`. In the snippet, `decimals` is the method's decimals, `mppx` is the handler above, and `currentQuoteBaseUnits()` returns the quote in base units.
 
 ```ts
-import { Credential } from 'mppx'
+import { Challenge, Credential } from 'mppx'
 import { formatUnits } from 'viem'
 
-const header = request.headers.get('Authorization') ?? ''
-const payment = Credential.extractPaymentScheme(header)
-const echoed = payment ? Credential.deserialize(payment).challenge.request.amount : undefined
-const echoedBase = typeof echoed === 'string' ? BigInt(echoed) : undefined
 const quote = await currentQuoteBaseUnits()
-const base = echoedBase !== undefined && echoedBase * 10n >= quote * 9n ? echoedBase : quote
-const amount = formatUnits(base, decimals)
+let base = quote
+const payment = Credential.extractPaymentScheme(request.headers.get('Authorization') ?? '')
+if (payment) {
+  const credential = Credential.deserialize(payment)
+  const echoed = credential.challenge.request.amount
+  if (
+    typeof echoed === 'string' &&
+    /^\d+$/.test(echoed) &&
+    Challenge.verify(credential.challenge, { secretKey: process.env.MPP_SECRET_KEY! })
+  ) {
+    const echoedBase = BigInt(echoed)
+    if (echoedBase * 10n >= quote * 9n && echoedBase * 10n <= quote * 11n) base = echoedBase
+  }
+}
 
-const response = await mppx.charge({ amount })(request)
+const response = await mppx.charge({ amount: formatUnits(base, decimals) })(request)
 if (response.status === 402) return response.challenge
 return response.withReceipt(Response.json({ data: '...' }))
 ```
